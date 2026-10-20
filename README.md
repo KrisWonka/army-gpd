@@ -48,17 +48,19 @@ avoidance never reached a working state; the picks below are in open scenes and 
 ## How it works
 
 ```
- wrist RGB-D camera ──► /rgbd_cam/depth/points (camera frame — moves with every joint)
-                              │
-                pointcloud_to_base        live TF → base_link, downsampled
-                              │
-                    /rgbd_cam/depth/points_base
-                              │
- operator clicks item ──► gpd_once_server  (gpd_ros + GPD, unchanged) ──► ranked candidate poses
- in the UI                    │
-                       gpd_grasp_node      reachability box → rank → approach / retreat → /grasp action
-                              │
-                     JetArm servo controller
+wrist RGB-D camera
+   │   /rgbd_cam/depth/points  (camera frame — changes with every joint move)
+   ▼
+pointcloud_to_base          live TF → base_link, downsampled
+   │   /rgbd_cam/depth/points_base
+   ▼
+gpd_once_server             gpd_ros + GPD (unchanged); runs once when the
+   │                        operator clicks an item → ranked candidates
+   ▼
+gpd_grasp_node              reachability box → rank → approach / retreat
+   │   /grasp action
+   ▼
+JetArm servo controller
 ```
 
 ### 1. Choosing one grasp out of a hundred
@@ -113,17 +115,17 @@ and an English / Chinese toggle.
 ## Repository layout
 
 ```
-gpd/                  GPD core library (C++, upstream, unchanged) — config in cfg/ros_eigen_params.cfg
-gpd_ros/              GPD's ROS wrapper (upstream) + gpd_once.launch for single-shot detection
+gpd/                  GPD core library (C++, upstream, unchanged)
+gpd_ros/              GPD's ROS wrapper (upstream) + gpd_once.launch
 jetarm_ui/
   scripts/
     gpd_grasp_node.py              grasp selection and execution
     pointcloud_to_base.py          wrist cloud → base_link bridge
     tf_calibration_control_ui.py   PyQt5 operator interface
-    jetarm_ui_node.py              standalone arm-control UI (incl. camera exposure / white balance)
+    jetarm_ui_node.py              standalone arm-control UI (exposure, WB)
     tf_calibration_tool.py         standalone hand-eye calibration tool
-  launch/             tf_calibration_control_ui.launch (full system), gpd_grasp.launch, …
-  config/             tf_calibration.yaml (calibration, offsets, GPD tuning), ui_config.yaml
+  launch/             tf_calibration_control_ui.launch = full system
+  config/             tf_calibration.yaml, ui_config.yaml
 user_config/          per-user overrides that survive redeploys
 start_tf_ui.sh        one-shot launcher deployed on the arm
 docs/media/           images and clips for this README
@@ -143,7 +145,7 @@ cd gpd && mkdir build && cd build && cmake .. && make -j$(nproc) && sudo make in
 cp -r gpd_ros jetarm_ui ~/jetarm/src/
 cd ~/jetarm && catkin_make && source devel/setup.bash
 
-# 3. Launch everything (camera, colour detection, point-cloud bridge, GPD server, grasp node, UI)
+# 3. Launch the whole system (camera, detection, bridge, GPD, grasp node, UI)
 ./start_tf_ui.sh            # or: roslaunch jetarm_ui tf_calibration_control_ui.launch
 ```
 

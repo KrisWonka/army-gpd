@@ -36,17 +36,19 @@
 ## 工作原理
 
 ```
- 腕装 RGB-D 相机 ──► /rgbd_cam/depth/points（相机坐标系 —— 每动一次关节就变一次）
-                              │
-                pointcloud_to_base        经实时 TF 转到 base_link，并降采样
-                              │
-                    /rgbd_cam/depth/points_base
-                              │
- 操作员在界面上 ──► gpd_once_server（gpd_ros + GPD，未修改）──► 排好序的候选位姿
- 点选目标                     │
-                       gpd_grasp_node      可达盒过滤 → 排序 → 接近 / 撤离 → /grasp 动作
-                              │
-                       JetArm 舵机控制器
+腕装 RGB-D 相机
+   │   /rgbd_cam/depth/points（相机坐标系，每动一次关节就变）
+   ▼
+pointcloud_to_base          经实时 TF 转到 base_link，并降采样
+   │   /rgbd_cam/depth/points_base
+   ▼
+gpd_once_server             gpd_ros + GPD（未修改）；操作员点选
+   │                        目标时跑一次 → 排好序的候选位姿
+   ▼
+gpd_grasp_node              可达盒过滤 → 排序 → 接近 / 撤离
+   │   /grasp 动作
+   ▼
+JetArm 舵机控制器
 ```
 
 ### 1. 从一百个候选里挑一个
@@ -82,14 +84,14 @@ GPD 是为固定安装的相机写的 —— 相机在外面看着场景，机�
 ## 仓库结构
 
 ```
-gpd/                  GPD 核心库（C++，上游代码，未修改）—— 配置在 cfg/ros_eigen_params.cfg
+gpd/                  GPD 核心库（C++，上游代码，未修改）
 gpd_ros/              GPD 的 ROS 封装（上游）+ 单次检测用的 gpd_once.launch
 jetarm_ui/
   scripts/
     gpd_grasp_node.py              抓取选择与执行
     pointcloud_to_base.py          腕装点云 → base_link 桥接
     tf_calibration_control_ui.py   PyQt5 操作界面
-    jetarm_ui_node.py              独立的机械臂控制界面（含相机曝光 / 白平衡）
+    jetarm_ui_node.py              独立的机械臂控制界面（含曝光、白平衡）
     tf_calibration_tool.py         独立的手眼标定工具
   launch/             tf_calibration_control_ui.launch（整套系统）、gpd_grasp.launch 等
   config/             tf_calibration.yaml（标定、偏移、GPD 调参）、ui_config.yaml
