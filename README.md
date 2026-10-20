@@ -1,257 +1,208 @@
-# army_gpd — JetArm GPD 抓取系统
+# ArmY — Grasp-Pose Selection on a Desktop Robot Arm
 
-基于 [GPD (Grasp Pose Detection)](https://github.com/atenpas/gpd) 的 6-DOF 机械臂抓取系统，运行于 **ROS Melodic + JetArm (Hiwonder)** 平台。包含点云处理、抓取规划、交互式 UI 三大模块。
+**English** | [中文](README.zh-CN.md)
 
----
+The grasp pipeline of **ArmY**, a capstone team's grocery-shelf picking robot built on a Hiwonder JetArm
+with a depth camera on its wrist. The open-source [GPD](https://github.com/atenpas/gpd) library proposes
+around a hundred candidate gripper poses per scan; this repository is everything around it that turns that
+into one pick on this arm — the **grasp-selection node**, the **point-cloud bridge** that puts a
+wrist-mounted camera's cloud into the arm's base frame, and a **PyQt5 operator interface** for
+calibration, tuning and candidate selection.
 
-## 目录结构
+<p align="center">
+  <img src="docs/media/army_hero.webp" width="560" alt="The green JetArm reaching down and picking an object off a kitchen counter.">
+</p>
+
+> **Project context** — Senior design capstone (MAE 151A/B), UC Irvine, five-person team,
+> Oct 2025 – Mar 2026, sponsored by Prof. Solmaz Kia. The mechanical design, motion-planning line and
+> electrical work were teammates'. **Mine was the grasp pipeline**: the grasp-selection node, the
+> point-cloud bridge, the operator interface, and verification of the perception and grasp requirements.
+> GPD itself is upstream code, included unchanged.
+> Write-up with videos: [krisxia.com/army](https://krisxia.com/army.html)
+
+## Results
+
+Measured against the team's requirements — including the ones that were not met:
+
+| Requirement | Result | Status |
+|---|---|---|
+| Target detection, baseline + cluttered sets (distractors, partial occlusion) | **15 / 15** | Met |
+| Grasp sequence automation — the operator only clicks the item | detection → selection → pick → extraction, no intervention | Met |
+| Grasp position within ± 1.0 cm for 95% of samples | **7 / 10** | **Not met** |
+| Pick cycle time < 45 s | 10 – 60 s | **Not met** |
+
+15/15 detection is not 15/15 grasping: the system almost always sees the item and still does not always
+know where it is well enough to grasp it cleanly. The limit is the depth camera — a grasp pose is only as
+accurate as the surface it was fitted to, and this cloud is ragged at its edges. Shelf-aware obstacle
+avoidance never reached a working state; the picks below are in open scenes and on a rack.
+
+<table>
+  <tr>
+    <td width="33%"><img src="docs/media/army_pick_tool.webp" alt="Picking a folding multitool lying flat on the counter."></td>
+    <td width="33%"><img src="docs/media/army_pick_bottle.webp" alt="Picking a tapered drink bottle with no flat faces."></td>
+    <td width="33%"><img src="docs/media/army_pick_bench.webp" alt="Picking a red block on a steel lab bench under different lighting."></td>
+  </tr>
+</table>
+<p align="center"><sub>Same pipeline, three objects (2.5× speed). Left: rigid, low-profile — a multitool lying flat · Middle: irregular, tapered — no flat faces anywhere · Right: new room, new bench, different lighting</sub></p>
+
+## How it works
 
 ```
-army_gpd/
-├── gpd/                  # GPD 核心库（C++，含预训练模型）
-│   ├── cfg/              #   ros_eigen_params.cfg — 主配置文件
-│   ├── models/           #   LeNet / Caffe / OpenVINO 模型权重
-│   ├── src/              #   C++ 源码
-│   └── include/          #   头文件
-├── gpd_ros/              # GPD 的 ROS 封装
-│   ├── launch/           #   gpd_once.launch, ur5.launch
-│   ├── msg/              #   GraspConfig, GraspConfigList, CloudIndexed …
-│   ├── srv/              #   detect_grasps.srv
-│   └── src/              #   C++ ROS 节点
-├── jetarm_ui/            # 控制 UI + 抓取节点 + 点云桥接
-│   ├── scripts/          #   Python 脚本（UI、抓取、点云变换）
-│   ├── launch/           #   启动文件
-│   └── config/           #   YAML 配置
-├── user_config/          # 用户级独立配置（不随代码部署覆盖）
-├── start_tf_ui.sh        # 一键启动脚本（部署到机械臂桌面）
-└── README.md
+ wrist RGB-D camera ──► /rgbd_cam/depth/points (camera frame — moves with every joint)
+                              │
+                pointcloud_to_base        live TF → base_link, downsampled
+                              │
+                    /rgbd_cam/depth/points_base
+                              │
+ operator clicks item ──► gpd_once_server  (gpd_ros + GPD, unchanged) ──► ranked candidate poses
+ in the UI                    │
+                       gpd_grasp_node      reachability box → rank → approach / retreat → /grasp action
+                              │
+                     JetArm servo controller
 ```
 
----
+### 1. Choosing one grasp out of a hundred
 
-## 系统架构
+To grasp an object the arm needs a pose in space — where to put the jaws, from which direction, how far
+to open them. GPD samples the point cloud and returns a ranked set of candidate gripper poses: a great
+many on a cluttered scene, plenty of them unusable — driving the gripper through the surface the item
+rests on, or sitting on the ragged fringe of the cloud. `gpd_grasp_node.py` adds:
+
+- **a reachability box** — candidates outside a conservative box in the arm's base frame are dropped
+  before anything else is considered; this removes most of them;
+- **ranking** — what survives is ordered by the classifier's own score, with distance to a preferred
+  point as the tie-break;
+- **execution** — a slanted push-pick approach with configurable attack angle, approach distance and
+  retreat, sent to the arm's `/grasp` motion action.
+
+<p align="center">
+  <img src="docs/media/gpd_candidates_rviz.jpg" width="620" alt="RViz on the robot's laptop: a white point cloud of the scanned scene with blue candidate gripper poses generated on it, and a terminal showing gpd_grasp subscribed to /detect_grasps/clustered_grasps.">
+</p>
+<p align="center"><sub>The white surface is the scanned point cloud; the blue jaws are candidate grasps generated on it.</sub></p>
+
+### 2. Making three pieces agree on where things are
+
+GPD is written for a camera on a fixed mount, watching the scene from outside while the arm moves through
+it. Here the depth camera is bolted to the wrist, directly above the jaws, so there is no fixed
+camera-to-base extrinsic, and the frame the cloud arrives in is different after every joint move.
+
+That breaks an assumption GPD never states. It crops with a plain box of metres — which describes the
+space above the table **only if the cloud is already in the arm's base frame**. A wrist-relative cloud
+gets a different wrong volume cut out of it after every move, and nothing errors: the arm reaches
+confidently for a place that is not there. So `pointcloud_to_base.py` pulls every cloud through the
+live TF tree into `base_link` first, downsampling on the way.
+
+Transforming the few returned poses afterwards would be far cheaper than transforming a few hundred
+thousand points — but the crop takes effect *before* GPD sees the data, so on an untransformed cloud GPD
+generates many candidates outside the box, and those can score high enough to crowd out the ones on the
+item. That is what happened in testing.
+
+### 3. An interface an operator can drive
+
+<p align="center">
+  <img src="docs/media/army_gui.webp" width="720" alt="The PyQt5 operator interface: live camera view, TF calibration sliders, grasp offset and GPD tuning controls, a scan progress window and a candidate-selection window, while the arm completes a pick.">
+</p>
+<p align="center"><sub>Detection, candidate selection and the pick, end to end (2× speed).</sub></p>
+
+`tf_calibration_control_ui.py` keeps everything that has to be tuned on the real arm adjustable while it
+runs, so an experiment costs a slider instead of a rebuild: hand-eye calibration of the
+`link5 → rgbd_cam_link` transform, grasp offsets in `base_link`, GPD tuning (attack angle, approach
+distance, edge margin and penalty, candidate-cluster radius), a single-shot scan trigger, a candidate picker that clusters near-duplicate grasps, arm speed presets,
+and an English / Chinese toggle.
+
+## Repository layout
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    RGB-D Camera (Astra)                   │
-│  /rgbd_cam/depth/points    /rgbd_cam/color/camera_info   │
-│  /rgbd_cam/depth/image_raw /color_detection/image_result │
-└──────────┬──────────────────────────┬────────────────────┘
-           │                          │
-     PointCloud2                   CameraInfo / Image
-           │                          │
-           ▼                          ▼
-┌─────────────────────┐   ┌───────────────────────────────┐
-│ pointcloud_to_base  │   │  tf_calibration_control_ui    │
-│ (TF 变换 + 降采样)  │   │  (PyQt5 交互式控制 UI)        │
-│                     │   │  · TF 标定                    │
-│ depth → base_link   │   │  · 候选夹取可视化 & 手动选择  │
-└────────┬────────────┘   │  · 速度/偏移/参数调节         │
-         │                │  · 单次 GPD 扫描触发           │
-    PointCloud2           └──────┬────────────────────────┘
-    (base_link)                  │ Trigger service
-         │                       ▼
-         │            ┌─────────────────────┐
-         └───────────▶│   gpd_once_server   │  (gpd_ros)
-                      │ detect_grasps 服务  │
-                      └────────┬────────────┘
-                               │ GraspConfigList
-                               ▼
-                      ┌─────────────────────┐
-                      │   gpd_grasp_node    │
-                      │ 评分/排序/IK/执行   │
-                      │ 斜向推抓 + 避边策略 │
-                      └────────┬────────────┘
-                               │ MultiRawIdPosDur
-                               ▼
-                      ┌─────────────────────┐
-                      │   JetArm 舵机控制器  │
-                      │ /controllers/...    │
-                      └─────────────────────┘
+gpd/                  GPD core library (C++, upstream, unchanged) — config in cfg/ros_eigen_params.cfg
+gpd_ros/              GPD's ROS wrapper (upstream) + gpd_once.launch for single-shot detection
+jetarm_ui/
+  scripts/
+    gpd_grasp_node.py              grasp selection and execution
+    pointcloud_to_base.py          wrist cloud → base_link bridge
+    tf_calibration_control_ui.py   PyQt5 operator interface
+    jetarm_ui_node.py              standalone arm-control UI (incl. camera exposure / white balance)
+    tf_calibration_tool.py         standalone hand-eye calibration tool
+  launch/             tf_calibration_control_ui.launch (full system), gpd_grasp.launch, …
+  config/             tf_calibration.yaml (calibration, offsets, GPD tuning), ui_config.yaml
+user_config/          per-user overrides that survive redeploys
+start_tf_ui.sh        one-shot launcher deployed on the arm
+docs/media/           images and clips for this README
 ```
 
----
+## Build and run
 
-## 需要对接的外部接口
-
-### 1. ROS Topics（需要外部提供）
-
-| Topic | 消息类型 | 提供方 | 说明 |
-|-------|---------|--------|------|
-| `/rgbd_cam/depth/points` | `sensor_msgs/PointCloud2` | RGB-D 相机驱动 | 原始深度点云 |
-| `/rgbd_cam/depth/image_raw` | `sensor_msgs/Image` | RGB-D 相机驱动 | 深度图（UI 显示） |
-| `/rgbd_cam/color/camera_info` | `sensor_msgs/CameraInfo` | RGB-D 相机驱动 | 相机内参（投影用） |
-| `/color_detection/image_result` | `sensor_msgs/Image` | color_detection 节点 | RGB 画面（UI 显示） |
-| `/object/pixel_coords` | `hiwonder_interfaces/ObjectsInfo` | color_detection 节点 | 目标检测结果 |
-
-### 2. ROS Topics（本系统发布）
-
-| Topic | 消息类型 | 发布方 | 说明 |
-|-------|---------|--------|------|
-| `/rgbd_cam/depth/points_base` | `sensor_msgs/PointCloud2` | `pointcloud_to_base` | base_link 坐标系下的点云 |
-| `/detect_grasps/clustered_grasps` | `gpd_ros/GraspConfigList` | `gpd_once_server` | GPD 候选抓取列表 |
-| `/controllers/multi_id_pos_dur` | `hiwonder_interfaces/MultiRawIdPosDur` | `gpd_grasp_node` / UI | 舵机运动指令 |
-| `/gpd_grasp/debug_markers` | `visualization_msgs/MarkerArray` | `gpd_grasp_node` | RViz 调试标记 |
-| `/gpd_once_server/plot_grasps` | `visualization_msgs/MarkerArray` | `gpd_once_server` | GPD 夹爪可视化 |
-
-### 3. ROS Services（需要外部提供）
-
-| Service | 类型 | 提供方 | 说明 |
-|---------|------|--------|------|
-| `/color_detection/enter` | `std_srvs/Empty` | color_detection 包 | 进入颜色检测模式 |
-| `/color_detection/start` | `std_srvs/Empty` | color_detection 包 | 开始检测 |
-| `/color_detection/stop` | `std_srvs/Empty` | color_detection 包 | 停止检测 |
-| `/color_detection/exit` | `std_srvs/Empty` | color_detection 包 | 退出检测模式 |
-| `/rgbd_cam/set_uvc_auto_exposure` | `std_srvs/SetBool` | astra_camera 驱动 | 自动曝光开关 |
-| `/rgbd_cam/set_uvc_exposure` | `astra_camera/SetInt32` | astra_camera 驱动 | 手动曝光值 |
-| `/rgbd_cam/set_uvc_auto_white_balance` | `std_srvs/SetBool` | astra_camera 驱动 | 自动白平衡开关 |
-| `/lab_config_manager/enter` | `std_srvs/Trigger` | lab_config 包 | 加载 LAB 颜色配置 |
-
-### 4. ROS Services（本系统提供）
-
-| Service | 类型 | 提供方 | 说明 |
-|---------|------|--------|------|
-| `/gpd_once_server/detect_grasps` | `gpd_ros/detect_grasps` | `gpd_once_server` | 单次抓取检测 |
-| `/gpd_grasp/trigger` | `std_srvs/Trigger` | `gpd_grasp_node` | 触发一次抓取 |
-| `/gpd_grasp/clear_cache` | `std_srvs/Trigger` | `gpd_grasp_node` | 清除缓存的抓取结果 |
-
-### 5. TF 坐标变换（需要外部提供）
-
-| Parent | Child | 提供方 | 说明 |
-|--------|-------|--------|------|
-| `base_link` | `link1` … `link5` | 机器人 URDF / `robot_state_publisher` | 机械臂关节链 |
-| `rgbd_cam_link` | `rgbd_cam_color_optical_frame` | 相机驱动 (astra) | 相机光学坐标系 |
-| `rgbd_cam_link` | `rgbd_cam_depth_optical_frame` | 相机驱动 (astra) | 深度光学坐标系 |
-
-> **注意**: `link5 → rgbd_cam_link` 由本系统内的 `static_transform_publisher` 或 UI 的 TF 标定模块发布，参数在 `tf_calibration.yaml` 中配置。
-
-### 6. ROS Actions（需要外部提供）
-
-| Action | 类型 | 提供方 | 说明 |
-|--------|------|--------|------|
-| `/grasp` | `hiwonder_interfaces/MoveAction` | JetArm 运动控制器 | 机械臂轨迹执行 |
-
-### 7. 舵机接口
-
-| Topic | 消息类型 | 说明 |
-|-------|---------|------|
-| `/controllers/multi_id_pos_dur` | `hiwonder_interfaces/MultiRawIdPosDur` | 发送舵机 ID + 位置 + 时长 |
-
-舵机编号：ID 1–5 为关节舵机，ID 10 为夹爪舵机。
-
-### 8. 外部 ROS 包依赖
-
-| 包名 | 用途 | 安装方式 |
-|------|------|---------|
-| `jetarm_bringup` | 机器人基础启动 (base.launch) | JetArm SDK |
-| `jetarm_peripherals` | 相机启动 (camera.launch) | JetArm SDK |
-| `jetarm_driver` | 舵机驱动 | JetArm SDK |
-| `hiwonder_interfaces` | 自定义消息/动作 | JetArm SDK |
-| `color_detection` | 颜色检测节点 | JetArm SDK |
-| `lab_config` | LAB 颜色配置管理 | JetArm SDK |
-| `astra_camera` | Astra RGB-D 驱动 | `ros-melodic-astra-camera` |
-| `jetarm_6dof_moveit_config` | MoveIt 配置 (RViz 可视化) | JetArm SDK |
-| `tf2_ros` / `tf2_sensor_msgs` | TF 坐标变换 | `ros-melodic-tf2-*` |
-
-### 9. 系统级依赖
-
-| 库 | 版本要求 | 用途 |
-|----|---------|------|
-| **PCL** | ≥ 1.9 | 点云处理 |
-| **Eigen** | ≥ 3.0 | 线性代数运算 |
-| **OpenCV** | ≥ 3.4 | 图像处理 / CNN 推理 |
-| **Python 3** + PyQt5 | — | UI 界面 |
-| **ROS Melodic** | — | 基础框架 |
-
----
-
-## 快速部署
-
-### 1. 编译 GPD 核心库
+Runs on the JetArm's onboard computer under **ROS Melodic** with the JetArm SDK packages
+(`jetarm_bringup`, `jetarm_peripherals`, `jetarm_driver`, `hiwonder_interfaces`, `color_detection`,
+`lab_config`), `astra_camera`, PCL ≥ 1.9, Eigen 3, OpenCV ≥ 3.4 and Python 3 + PyQt5.
 
 ```bash
-cd gpd
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
-sudo make install
-```
+# 1. GPD core library
+cd gpd && mkdir build && cd build && cmake .. && make -j$(nproc) && sudo make install
 
-### 2. 编译 ROS 包
-
-将 `gpd_ros` 和 `jetarm_ui` 放入 catkin 工作空间：
-
-```bash
+# 2. ROS packages, in the JetArm catkin workspace
 cp -r gpd_ros jetarm_ui ~/jetarm/src/
-cd ~/jetarm
-catkin_make
-source devel/setup.bash    # 或 setup.zsh
+cd ~/jetarm && catkin_make && source devel/setup.bash
+
+# 3. Launch everything (camera, colour detection, point-cloud bridge, GPD server, grasp node, UI)
+./start_tf_ui.sh            # or: roslaunch jetarm_ui tf_calibration_control_ui.launch
 ```
 
-### 3. 配置
+`start_tf_ui.sh` hard-codes the arm's `ROS_IP` / `ROS_MASTER_URI` and workspace path — edit those for
+another setup.
 
-- **相机标定**: 编辑 `jetarm_ui/config/tf_calibration.yaml` 中的 `transform` 字段
-- **抓取偏移**: 编辑 `grasp_offset` 字段，或在 UI 中实时调节
-- **GPD 参数**: 编辑 `gpd/cfg/ros_eigen_params.cfg`（workspace、采样数等）
-- **模型路径**: 确保 `weights_file` 指向正确的 `models/lenet/15channels/params/` 路径
+| Config file | What it holds |
+|---|---|
+| `gpd/cfg/ros_eigen_params.cfg` | GPD core: workspace box, number of samples, CNN channels, `weights_file` path |
+| `jetarm_ui/config/tf_calibration.yaml` | hand-eye transform, grasp offsets, GPD tuning values written by the UI |
+| `jetarm_ui/config/ui_config.yaml` | UI defaults (camera topics, arm poses) |
+| `user_config/ui_config.user.yaml` | per-user overrides, not overwritten on redeploy |
 
-### 4. 启动
+<details>
+<summary><b>Interfaces (topics, services, TF, actions)</b></summary>
 
-```bash
-# 方式一：使用启动脚本（推荐）
-chmod +x start_tf_ui.sh
-./start_tf_ui.sh
+**Consumed**
 
-# 方式二：手动 roslaunch
-roslaunch jetarm_ui tf_calibration_control_ui.launch
-```
+| Name | Type | Provided by |
+|---|---|---|
+| `/rgbd_cam/depth/points` | `sensor_msgs/PointCloud2` | camera driver |
+| `/rgbd_cam/depth/image_raw` | `sensor_msgs/Image` | camera driver (UI display) |
+| `/rgbd_cam/color/camera_info` | `sensor_msgs/CameraInfo` | camera driver (projection) |
+| `/color_detection/image_result` | `sensor_msgs/Image` | `color_detection` (UI display) |
+| `/object/pixel_coords` | `hiwonder_interfaces/ObjectsInfo` | `color_detection` — detected targets |
+| `/color_detection/{enter,start,stop,exit}` | `std_srvs/Empty` | `color_detection` |
+| `/rgbd_cam/set_uvc_auto_exposure`, `/rgbd_cam/set_uvc_auto_white_balance` | `std_srvs/SetBool` | `astra_camera` |
+| `/rgbd_cam/set_uvc_exposure` | `astra_camera/SetInt32` | `astra_camera` |
+| `/lab_config_manager/enter` | `std_srvs/Trigger` | `lab_config` |
+| `/grasp` (action) | `hiwonder_interfaces/MoveAction` | JetArm motion controller |
+| TF `base_link → link1 … link5` | — | URDF / `robot_state_publisher` |
 
----
+**Provided**
 
-## 关键配置文件
+| Name | Type | Node |
+|---|---|---|
+| `/rgbd_cam/depth/points_base` | `sensor_msgs/PointCloud2` | `pointcloud_to_base` |
+| `/gpd_once_server/detect_grasps` (service) | `gpd_ros/detect_grasps` | `gpd_once_server` |
+| `/detect_grasps/clustered_grasps` | `gpd_ros/GraspConfigList` | `gpd_once_server` |
+| `/gpd_grasp/trigger`, `/gpd_grasp/clear_cache` (services) | `std_srvs/Trigger` | `gpd_grasp_node` |
+| `/controllers/multi_id_pos_dur` | `hiwonder_interfaces/MultiRawIdPosDur` | `gpd_grasp_node` / UI — servo ID, position, duration (IDs 1–5 joints, 10 gripper) |
+| `/gpd_grasp/debug_markers`, `/gpd_once_server/plot_grasps` | `visualization_msgs/MarkerArray` | RViz debugging |
+| TF `link5 → rgbd_cam_link` | — | static publisher / UI calibration (`tf_calibration.yaml`) |
 
-| 文件 | 说明 |
-|------|------|
-| `gpd/cfg/ros_eigen_params.cfg` | GPD 核心参数（workspace、采样数、CNN 通道数等） |
-| `jetarm_ui/config/tf_calibration.yaml` | TF 标定值 + 抓取偏移 + GPD 调优参数 |
-| `jetarm_ui/config/ui_config.yaml` | UI 默认配置（相机 topic、机械臂姿态等） |
-| `user_config/ui_config.user.yaml` | 用户独立配置（不随代码更新覆盖） |
+</details>
 
----
+<details>
+<summary><b>Where my work sits in the team's breakdown</b></summary>
 
-## GPD 核心参数说明
+<p align="center">
+  <img src="docs/media/team_subsystems.jpg" width="760" alt="The project's structural decomposition into six subsystems: simulation, perception, low-level driver and ROS, kinematics and motion planning, hardware modification and calibration, and visual servoing and integration.">
+</p>
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `num_samples` | 40 | 从点云中采样的候选点数 |
-| `num_threads` | 4 | CPU 线程数 |
-| `workspace` | `-0.05 0.36 -0.30 0.30 -0.05 0.40` | 点云裁剪范围 (m) |
-| `workspace_grasps` | (同上) | 抓取候选过滤范围 |
-| `num_selected` | 20 | 最终输出的抓取候选数 |
-| `image_num_channels` | 15 | CNN 输入通道数 |
-| `weights_file` | `models/lenet/15channels/params/` | 模型权重路径 |
+The project as the team divided it. My work sat in the perception column and the integration column on
+the right.
 
----
-
-## 自定义消息/服务 (gpd_ros)
-
-### 消息
-
-| 消息 | 字段 |
-|------|------|
-| `GraspConfig` | `position`, `approach`, `binormal`, `axis`, `width`, `score`, `sample` |
-| `GraspConfigList` | `header`, `grasps[]` |
-| `CloudIndexed` | `cloud_sources`, `indices[]` |
-| `CloudSources` | `cloud`, `camera_source[]`, `view_points[]` |
-
-### 服务
-
-| 服务 | 请求 | 响应 |
-|------|------|------|
-| `detect_grasps` | `CloudIndexed cloud_indexed` | `GraspConfigList grasp_configs` |
-
----
+</details>
 
 ## License
 
-GPD 核心库遵循 BSD 协议。其余代码仅供学习研究使用。
+GPD (`gpd/`, `gpd_ros/`) is distributed under its own BSD 2-Clause license — see the license files in those
+directories. The rest of this repository is shared for learning and research.
